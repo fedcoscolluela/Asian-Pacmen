@@ -52,3 +52,31 @@ Run it exactly as above:
 The approaches we tried (reflex, A*, alpha-beta/expectimax, MCTS, approximate Q-learning,
 IW / IW(2) / BFWS), the experiments and the failure analysis are in the report
 (to follow, we are still working on it)...
+
+## Running locally
+
+From the repository root (Python 3.8+; we tested 3.9 and 3.12):
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+git submodule update --init --remote
+cd pacman-contest && pip install -e . && pip install -r requirements.txt
+cd src/contest
+```
+
+Play our team (blue) against the staff baseline (red):
+
+```bash
+python capture.py -r baseline_team -b ../../../my_team.py
+```
+
+Play as red instead:
+
+```bash
+python capture.py -r ../../../my_team.py -b baseline_team
+```
+
+Red's score is positive and blue's is negative. The final line states the winner.
+
+In a new terminal, run `source venv/bin/activate` again before playing.
