@@ -1,2 +1,54 @@
-# Asian-Pacmen
-UPF Eutopia Pacman Contest
+# Pacman Agent (Asian Pacmen Version)
+
+A template for coding a pacman agent.
+
+## Setting up the environment
+1. Copy the code from this framework to create your Pacman Agent.
+2. Clone your own pacman-agent repository (e.g., `git clone git@github.com:Username/pacman-agent.git`)
+3. Go into pacman-agent folder, `cd pacman-agent/`
+4. Run `git submodule update --init --remote` to pull the last pacman-contest
+5. Create a virtual environment (e.g., `python3.8 -m venv venv`)
+6. Activate the virtual environment with `source venv/bin/activate`
+7. Go to the pacman-contest folder and install the requirements:
+    - `cd pacman-contest/`
+    - `pip install -r requirements.txt`
+    - `pip install -e .`
+
+## Coding a new agent
+In the root folder do the following:
+1. Create in `my_team.py` a class with the name of your agent that inherits from `CaptureAgent`, e.g. `class ReflexCaptureAgent(CaptureAgent):`
+2. In the new class, override the `def choose_action(self, game_state):` function to return the best next action (check the given source code example).
+3. (Optional) Add any other functions to the class for reasoning / learning and improving your agents decision which could also use other code sources in the same folder.
+
+To debug the agent you can run `capture.py` between the `baseline_team` and your current agent:
+1. `cd pacman-contest/src/contest/`
+2. `python capture.py -r baseline_team -b ../../../my_team.py`
+
+
+
+## Our agent
+
+`my_team.py` is built on the template above. The template's header, `create_team` and its
+`ReflexCaptureAgent`, `OffensiveReflexAgent` and `DefensiveReflexAgent` are kept unchanged.
+Only `create_team`'s default agents are ours:
+
+* `OffensiveIWAgent(CaptureAgent)`: width-based lookahead (IW(1) with novelty atoms
+  (cell, carried food)) on a fast forward model of the game, with HMM tracking of the
+  opponents and A* goal planning when no reward is in reach.
+* `DefensiveInterceptAgent(CaptureAgent)`: predicts an invader's path to our food and
+  intercepts it.
+
+Both override `choose_action`. If our planning ever raises an exception, the agent falls back
+to the template's reflex policy, so a bug cannot forfeit a game. The whole agent is
+a single file with no extra dependencies, and startup takes well under the 15 s allowance
+(`register_initial_state`). The average move is 20–40 ms; the worst move we measured was 0.72 s, with the CPU deliberately overloaded,
+against the 1 s limit.
+
+Run it exactly as above:
+
+    cd pacman-contest/src/contest/
+    python capture.py -r baseline_team -b ../../../my_team.py
+
+The approaches we tried (reflex, A*, alpha-beta/expectimax, MCTS, approximate Q-learning,
+IW / IW(2) / BFWS), the experiments and the failure analysis are in the report
+(to follow, we are still working on it)...
