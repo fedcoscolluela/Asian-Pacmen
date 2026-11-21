@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+# development folder: other teams' code and raw per-move timings stay local
+pacman-work/past_agents/
+pacman-work/results/*_times.json
