@@ -28,6 +28,8 @@ def create_team(first_index, second_index, is_red,
     return [eval(first)(first_index), eval(second)(second_index)]
 
 
+# ======== [KEY-9] ========
+# ATTACKER (main novelty): width-based planning IW(1) (beyond lecture, Lipovetzky & Geffner) over our Sim; prunes states whose atoms are not new, so it explores far with few nodes
 class IWOffense(PlannerOffense):
     TIME_BUDGET = 0.30   # the 6,000-node cap normally stops the search at ~0.1 s; this only binds on a busy machine
     GAMMA = 0.98
@@ -37,6 +39,8 @@ class IWOffense(PlannerOffense):
     STUCK_TURNS = 20   # stalemate breaker (0 = off): see unstick()
     STUCK_PUSH = 8     # moves of plain shortest-path play once a stalemate is detected
 
+    # ======== [KEY-10] ========
+    # Stalemate breaker (A11, found by tracing losses vs last edition's teams): detects being frozen next to a ghost and forces progress; +0.03..+0.09 points/game
     def unstick(self, gs):
         """Stalemate breaker. A ghost parked next to our Pacman can block it for hundreds
         of moves: every way out looks like death to the search, so it waits, and waiting
@@ -64,6 +68,8 @@ class IWOffense(PlannerOffense):
         path = astar(m, me, goals)
         return action_to(me, path[0]) if path else None
 
+    # ======== [KEY-11] ========
+    # Opponent model inside the search: ghosts are simulated as greedy chasers, so plans that walk into a trap are cut
     def ghost_model(self, sim, s, me_idx):
         """Move every opponent ghost one step with the fixed model."""
         m = self.m

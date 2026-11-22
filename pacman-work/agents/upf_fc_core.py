@@ -84,6 +84,8 @@ class MapInfo:
                 hd[c] = min((self.dist(c, b) for b in self.home_border(red)), default=0)
             self.homedist[red] = hd
 
+    # ======== [KEY-1] ========
+    # Precomputed all-pairs maze distances (BFS once at startup, inside the 15 s budget) -> O(1) distance lookups every move
     def _all_pairs(self):
         n = len(self.cells)
         idx, nb = self.idx, self.nbrs
@@ -106,6 +108,8 @@ class MapInfo:
     def dist(self, a, b):
         return self.D[self.idx[a]][self.idx[b]]
 
+    # ======== [KEY-2] ========
+    # Dead-end / corridor analysis of the map: cells where a Pacman can be trapped; food inside one is only taken if we can get out before a ghost seals it
     def _dead_ends(self):
         """Peel degree-1 cells repeatedly: what is removed lies in a tree-shaped dead end.
         depth[c] = steps from c back to the 'exit' cell where the dead end joins the loopy core."""
@@ -148,6 +152,8 @@ class MapInfo:
 
 
 # ---------------------------------------------------------------------- tracker
+# ======== [KEY-3] ========
+# HMM belief tracking (lecture: probabilistic state estimation) of unseen opponents: elapse = motion model, observe = noisy distance reading, plus hard evidence (eaten food, kills, sightings)
 class Tracker:
     """Exact HMM filtering of opponent positions, shared by the two teammates."""
     _by_team = {}
@@ -299,6 +305,8 @@ class Tracker:
 
 
 # --------------------------------------------------------------------- A* search
+# ======== [KEY-4] ========
+# A* search (lecture: heuristic search) with maze-distance heuristic and a pluggable danger cost; used by attacker, defender and stalemate breaker
 def astar(m, start, goals, cost_fn=None, max_expand=4000):
     """A* from start to the nearest of `goals` (a set). cost_fn(cell)->extra cost >= 0.
     Heuristic: true maze distance to the closest goal (exact without extra costs,
@@ -362,6 +370,8 @@ class SimState:
         return s
 
 
+# ======== [KEY-5] ========
+# Own lightweight forward model of the capture game (much faster than GameState.generate_successor), what makes width-based search affordable within 1 s
 class Sim:
     """Rules for SimState, from the point of view of team `red`.  score is red-positive."""
 
@@ -512,6 +522,8 @@ class BaseAgent(CaptureAgent):
     def setup(self, game_state):
         pass
 
+    # ======== [KEY-6] ========
+    # Runtime safety: every move is timed, the search stops at TIME_BUDGET (time_left), and any exception falls back to the staff reflex agent, so we never forfeit
     def choose_action(self, game_state):
         t0 = time.perf_counter()
         self.t_start = t0

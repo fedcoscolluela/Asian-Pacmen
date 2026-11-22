@@ -22,6 +22,22 @@ import time
 # from the staff template + pacman-work/agents/{upf_fc_core, a2_astar, a6_iw}.py.
 # Structure: [template header] [template create_team] [template reflex agents, unchanged,
 # used as fallback] [our toolkit and planners] [our team agents].
+#
+# ---------------- GUIDE FOR READERS: search for "[KEY-" to jump to each feature ----------------
+# Team: Asian-Pacmen. Attacker = IWOffense (width-based IW(1) search), defender = PlannerDefense (A* interception).
+#  [KEY-1]  all-pairs maze distances, precomputed at startup
+#  [KEY-2]  dead-end analysis of the map (trap avoidance)
+#  [KEY-3]  HMM belief tracking of unseen opponents
+#  [KEY-4]  A* search with a danger-aware cost
+#  [KEY-5]  own fast game simulator used by the search
+#  [KEY-6]  runtime safety: time budget + fallback, never forfeits
+#  [KEY-7]  risk-aware path cost near ghosts
+#  [KEY-8]  DEFENDER: predict invader path and intercept it
+#  [KEY-9]  ATTACKER: IW(1) width-based planning (main novelty, beyond lecture)
+#  [KEY-10] stalemate breaker (found by analysing losses to last edition's teams)
+#  [KEY-11] opponent ghost model inside the search
+# Full experiments, ablations and results: pacman-work/REPORT.md
+# -----------------------------------------------------------------------------------------------
 
 
 #################
@@ -282,6 +298,8 @@ class MapInfo:
                 hd[c] = min((self.dist(c, b) for b in self.home_border(red)), default=0)
             self.homedist[red] = hd
 
+    # ======== [KEY-1] ========
+    # Precomputed all-pairs maze distances (BFS once at startup, inside the 15 s budget) -> O(1) distance lookups every move
     def _all_pairs(self):
         n = len(self.cells)
         idx, nb = self.idx, self.nbrs
@@ -304,6 +322,8 @@ class MapInfo:
     def dist(self, a, b):
         return self.D[self.idx[a]][self.idx[b]]
 
+    # ======== [KEY-2] ========
+    # Dead-end / corridor analysis of the map: cells where a Pacman can be trapped; food inside one is only taken if we can get out before a ghost seals it
     def _dead_ends(self):
         """Peel degree-1 cells repeatedly: what is removed lies in a tree-shaped dead end.
         depth[c] = steps from c back to the 'exit' cell where the dead end joins the loopy core."""
@@ -346,6 +366,8 @@ class MapInfo:
 
 
 # ---------------------------------------------------------------------- tracker
+# ======== [KEY-3] ========
+# HMM belief tracking (lecture: probabilistic state estimation) of unseen opponents: elapse = motion model, observe = noisy distance reading, plus hard evidence (eaten food, kills, sightings)
 class Tracker:
     """Exact HMM filtering of opponent positions, shared by the two teammates."""
     _by_team = {}
@@ -497,6 +519,8 @@ class Tracker:
 
 
 # --------------------------------------------------------------------- A* search
+# ======== [KEY-4] ========
+# A* search (lecture: heuristic search) with maze-distance heuristic and a pluggable danger cost; used by attacker, defender and stalemate breaker
 def astar(m, start, goals, cost_fn=None, max_expand=4000):
     """A* from start to the nearest of `goals` (a set). cost_fn(cell)->extra cost >= 0.
     Heuristic: true maze distance to the closest goal (exact without extra costs,
@@ -560,6 +584,8 @@ class SimState:
         return s
 
 
+# ======== [KEY-5] ========
+# Own lightweight forward model of the capture game (much faster than GameState.generate_successor), what makes width-based search affordable within 1 s
 class Sim:
     """Rules for SimState, from the point of view of team `red`.  score is red-positive."""
 
@@ -710,6 +736,8 @@ class BaseAgent(CaptureAgent):
     def setup(self, game_state):
         pass
 
+    # ======== [KEY-6] ========
+    # Runtime safety: every move is timed, the search stops at TIME_BUDGET (time_left), and any exception falls back to the staff reflex agent, so we never forfeit
     def choose_action(self, game_state):
         t0 = time.perf_counter()
         self.t_start = t0
@@ -812,6 +840,8 @@ class PlannerMixin:
                 out.append(p)
         return out
 
+    # ======== [KEY-7] ========
+    # Risk-aware path cost: cells near (predicted) ghosts cost more, so A* trades path length for safety
     def danger_cost(self, threats, me):
         m = self.m
         if not threats:
@@ -934,6 +964,8 @@ class PlannerOffense(PlannerMixin, BaseAgent):
         return action_to(me, nxt)
 
 
+# ======== [KEY-8] ========
+# DEFENDER: predicts each invader's path to food with A* and moves to INTERCEPT it ahead of time instead of chasing from behind; uses HMM beliefs when invaders are not visible
 class PlannerDefense(PlannerMixin, BaseAgent):
     def predict_path(self, gs, o, start, steps=40):
         """Predicted future cells of invader o: greedy nearest-food chain, or the way home
@@ -1006,6 +1038,8 @@ from collections import deque
 
 
 
+# ======== [KEY-9] ========
+# ATTACKER (main novelty): width-based planning IW(1) (beyond lecture, Lipovetzky & Geffner) over our Sim; prunes states whose atoms are not new, so it explores far with few nodes
 class IWOffense(PlannerOffense):
     TIME_BUDGET = 0.30   # the 6,000-node cap normally stops the search at ~0.1 s; this only binds on a busy machine
     GAMMA = 0.98
@@ -1015,6 +1049,8 @@ class IWOffense(PlannerOffense):
     STUCK_TURNS = 20   # stalemate breaker (0 = off): see unstick()
     STUCK_PUSH = 8     # moves of plain shortest-path play once a stalemate is detected
 
+    # ======== [KEY-10] ========
+    # Stalemate breaker (A11, found by tracing losses vs last edition's teams): detects being frozen next to a ghost and forces progress; +0.03..+0.09 points/game
     def unstick(self, gs):
         """Stalemate breaker. A ghost parked next to our Pacman can block it for hundreds
         of moves: every way out looks like death to the search, so it waits, and waiting
@@ -1042,6 +1078,8 @@ class IWOffense(PlannerOffense):
         path = astar(m, me, goals)
         return action_to(me, path[0]) if path else None
 
+    # ======== [KEY-11] ========
+    # Opponent model inside the search: ghosts are simulated as greedy chasers, so plans that walk into a trap are cut
     def ghost_model(self, sim, s, me_idx):
         """Move every opponent ghost one step with the fixed model."""
         m = self.m

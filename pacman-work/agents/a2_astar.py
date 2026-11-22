@@ -39,6 +39,8 @@ class PlannerMixin:
                 out.append(p)
         return out
 
+    # ======== [KEY-7] ========
+    # Risk-aware path cost: cells near (predicted) ghosts cost more, so A* trades path length for safety
     def danger_cost(self, threats, me):
         m = self.m
         if not threats:
@@ -161,6 +163,8 @@ class PlannerOffense(PlannerMixin, BaseAgent):
         return action_to(me, nxt)
 
 
+# ======== [KEY-8] ========
+# DEFENDER: predicts each invader's path to food with A* and moves to INTERCEPT it ahead of time instead of chasing from behind; uses HMM beliefs when invaders are not visible
 class PlannerDefense(PlannerMixin, BaseAgent):
     def predict_path(self, gs, o, start, steps=40):
         """Predicted future cells of invader o: greedy nearest-food chain, or the way home
