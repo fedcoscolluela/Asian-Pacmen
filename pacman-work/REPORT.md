@@ -2,10 +2,10 @@
 
 **Team Asian-Pacmen** (Jan Federico Coscolluela IV, Ittehad Chowdhury). Autonomous Systems, UPF, EMAI 2026-27. Setup and run commands are in [`README.md`](README.md).
 
-**Submission:** `../my_team.py`. It combines **A6**, a width-based IW(1) attacker, with the **A2** A\*/HMM interception defender, on top of the staff template. Results:
+**Submission:** `../my_team.py`. It combines **A6**, a width-based IW(1) attacker, with the **A2** A\*/HMM interception defender, on top of the staff template, plus the A11 stalemate breaker (§7). Results:
 * First in a 9-team round-robin of our approaches, with 81% of points.
-* 392-46-90 against a 12-opponent pool and 628-84-36 against 17 teams from last edition.
-* Average move 13 ms; worst 356 ms with the machine fully loaded (limit 1 s).
+* 403-41-84 against a 12-opponent pool, 638-78-32 against 17 teams from last edition, and 308-32-20 against the 6 strongest of them on 30 unseen layouts.
+* Average move 14-19 ms; p99 under 125 ms with the machine fully loaded (limit 1 s).
 * No errors, time warnings or forfeits in any final test.
 
 ---
@@ -33,6 +33,7 @@ All approaches share one toolkit, so they differ only in how they decide.
 | A8 | `a8_hidden.py` | A6 + A2 reading the opponents' public hidden-state fields (§6) |
 | A9 | `a9_win.py` | Fixes from our loss analysis (§7) |
 | A10 | `a10_raid.py` | Defender that raids when nobody invades (§7) |
+| A11 | `a6_iw.py` (`unstick`) | Stalemate breaker for the attacker (§7), **submitted** |
 
 ## 3. Results
 
@@ -143,10 +144,24 @@ Full A9 collapses against double attackers (8-4-32 vs 29-3-12): with our attacke
 
 A10 beat the turtle team more often (37-7-0 vs 34-10-0) but lost elsewhere, worst against double attackers (17-6-21 vs 29-3-12) and the Q-learning team (25-2-17 vs 36-4-4). The defender only turns back once an opponent has crossed, by which time it is several steps away and the invader gets in free. Raiding also runs the search on both agents: A10 had 2 moves over 1 s (warnings) and a worst move of 1.17 s. **Not submitted.** A safer version would raid only after detecting that the opponents never invade.
 
+**Last edition's teams.** We ran 17 of last edition's public teams (used only as opponents, never copied). A round-robin of the top 10 ranked supergodgg (68% of points), lorecleme (56%), marinadalmau (54%), scooooooott (53%) and foxtrotdelta (50%); most are feature-weight reflex agents, some with A\* or belief tracking. Our losses against them clustered on `crowded`. A per-move trace of one loss showed our attacker stuck for 860 moves on one cell next to a parked ghost: every exit looked like death to IW(1), so it waited and scored nothing.
+
+**A11: stalemate breaker** (`IWOffense.unstick`). After 20 of our moves on at most 2 cells, as a Pacman with no change in food carried, the attacker follows the plain A\* path (home if carrying, else to food) for 8 moves. Paired on identical games (points W=3, T=1; difference per game ± SE):
+
+| test | A11 W-T-L | before W-T-L | difference |
+|---|---|---|---|
+| 17 past teams, 22 layouts | 638-78-32 | 628-84-36 | +0.03 ± 0.01 |
+| top 6 past teams, unseen RANDOM50-79 | 308-32-20 | 297-37-26 | +0.08 ± 0.03 |
+| own 12-opponent pool | 403-41-84 | 386-43-99 | +0.09 ± 0.04 |
+
+The largest gain was against lorecleme, our weakest matchup (+0.25 per game). The traced `crowded` loss went from -37 to -15. **Submitted.** The past-team run had 4 moves of 0.95-1.1 s, all in games against one opponent that saturates the CPU; replayed alone, our worst move in those games was 40 ms.
+
 | move times, full load (7 games on 8 cores) | moves | mean | p99 | max | over 1 s |
 |---|---|---|---|---|---|
-| submitted, own pool | 304,425 | 13 ms | 87 ms | 356 ms | 0 |
-| submitted, past teams | 426,306 | 14 ms | 93 ms | 267 ms | 0 |
+| before A11, own pool | 304,425 | 13 ms | 87 ms | 356 ms | 0 |
+| before A11, past teams | 426,306 | 14 ms | 93 ms | 267 ms | 0 |
+| A11 (submitted), own pool | 303,048 | 14 ms | 94 ms | 302 ms | 0 |
+| A11 (submitted), unseen layouts | 210,093 | 17 ms | 99 ms | 247 ms | 0 |
 
 ## 8. Limitations
 

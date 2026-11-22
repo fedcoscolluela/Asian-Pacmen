@@ -19,7 +19,7 @@ import sys
 from collections import deque
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from upf_fc_core import Sim, action_to  # noqa: E402
+from upf_fc_core import Sim, action_to, astar  # noqa: E402
 from a2_astar import PlannerOffense, PlannerDefense  # noqa: E402
 
 
@@ -34,6 +34,35 @@ class IWOffense(PlannerOffense):
     MAX_NODES = 6000
     USE_CARRY_ATOM = True
     LEAF_W = 0.3       # leaf penalty per carried pellet per square from home
+    STUCK_TURNS = 20   # stalemate breaker (0 = off): see unstick()
+    STUCK_PUSH = 8     # moves of plain shortest-path play once a stalemate is detected
+
+    def unstick(self, gs):
+        """Stalemate breaker. A ghost parked next to our Pacman can block it for hundreds
+        of moves: every way out looks like death to the search, so it waits, and waiting
+        earns nothing. After STUCK_TURNS of our moves on at most 2 cells, as a Pacman with
+        no change in food carried, we follow the plain shortest path (home if carrying,
+        else to food) for STUCK_PUSH moves. Returns an action, or None."""
+        if not self.STUCK_TURNS:
+            return None
+        st = gs.get_agent_state(self.index)
+        me = self.my_pos(gs)
+        h = getattr(self, '_hist', [])
+        h.append((me, st.num_carrying, st.is_pacman))
+        self._hist = h = h[-self.STUCK_TURNS:]
+        push = getattr(self, '_push', 0)
+        if push == 0 and len(h) == self.STUCK_TURNS and all(x[2] for x in h) \
+                and len({x[0] for x in h}) <= 2 and len({x[1] for x in h}) == 1:
+            push = self.STUCK_PUSH
+            self._hist = []
+        if push == 0 or not st.is_pacman:
+            self._push = 0
+            return None
+        self._push = push - 1
+        m = self.m
+        goals = set(m.home_border(self.red)) if st.num_carrying > 0 else set(self.get_food(gs).as_list())
+        path = astar(m, me, goals)
+        return action_to(me, path[0]) if path else None
 
     def ghost_model(self, sim, s, me_idx):
         """Move every opponent ghost one step with the fixed model."""
@@ -55,6 +84,9 @@ class IWOffense(PlannerOffense):
         return s
 
     def act(self, gs):
+        a = self.unstick(gs)
+        if a is not None:
+            return a
         m = self.m
         sim, root = Sim.from_game(gs, m, tracker=self.tracker, include_unseen=True,
                                   max_unseen_dist=12, ref=self.my_pos(gs))
