@@ -1207,3 +1207,728 @@ class DefensiveInterceptAgent(PlannerDefense, DefensiveReflexAgent):
 
     def fallback_action(self, game_state, legal):
         return DefensiveReflexAgent.choose_action(self, game_state)
+
+
+# =====================================================================================
+# v2 overrides (lab). Appended after Jan's unchanged my_team.py by build.py, followed by
+# a FLAGS dict. With every flag off, V2Attacker/V2Defender behave exactly like Jan's
+# OffensiveIWAgent/DefensiveInterceptAgent.
+# =====================================================================================
+from collections import deque as _deque
+
+FLAGS = {'late_allin': True, 'duel_def': True, 'duel_delay': True, 'bank_delay': True, 'duel_rebuild': True}
+
+_TEAM = {}            # per-colour shared state between our two agents
+
+
+def F(name):
+    return FLAGS.get(name, False)
+
+
+def _team(agent):
+    return _TEAM.setdefault(agent.red, {})
+
+
+def _observe_style(agent, n_invaders):
+    """R2 (CS470 paper): rolling 80-turn window of how many opponents invade."""
+    w = _team(agent).setdefault('win', _deque(maxlen=80))
+    w.append(n_invaders)
+
+
+def _calm(agent):
+    """Opponent rarely invades: >= 20 observed turns and an invader on < 25% of them."""
+    w = _team(agent).get('win')
+    if not w or len(w) < 20:
+        return False
+    return sum(1 for x in w if x > 0) / len(w) < 0.25
+
+
+def _style(agent):
+    w = _team(agent).get('win')
+    if not w or len(w) < 40:
+        return 'unknown'
+    any_inv = sum(1 for x in w if x > 0) / len(w)
+    two = sum(1 for x in w if x >= 2) / len(w)
+    if any_inv < 0.05:
+        return 'turtle'
+    if two >= 0.25:
+        return 'double'
+    return 'balanced'
+
+
+class _DuelTable:
+    """One ghost (ours) against one invading Pacman on our half, solved exactly by
+    retrograde analysis (pursuit-evasion / cops-and-robber backward induction).
+
+    State (g, p, t): ghost cell g, Pacman cell p (both on our half), t = 0 ghost to
+    move, t = 1 Pacman to move. The Pacman ESCAPES if it steps onto its own half or
+    onto one of our capsules (we then become scared). esc[t][g*n+p] is True iff the
+    Pacman can force an escape from that state; otherwise the ghost can keep it from
+    ever banking (catching it or holding it forever)."""
+
+    def __init__(self, m, red, caps, deadline):
+        cells = [c for c in m.cells if m.on_home_side(c, red)]
+        n = len(cells)
+        idx = {c: i for i, c in enumerate(cells)}
+        self.cells, self.idx, self.n = cells, idx, n
+        gm = [[idx[x] for x in m.nbrs[c] if x in idx] + [idx[c]] for c in cells]   # ghost moves
+        pm = [[idx[x] for x in m.nbrs[c] if x in idx] + [idx[c]] for c in cells]   # pacman moves on our half
+        exit_ = [any(x not in idx for x in m.nbrs[c]) for c in cells]               # can step home
+        capi = {idx[c] for c in caps if c in idx}
+        self.gm, self.caps0 = gm, frozenset(capi)
+        esc0 = bytearray(n * n)      # ghost to move
+        esc1 = bytearray(n * n)      # pacman to move
+        cnt = [0] * (n * n)          # ghost-to-move: moves not yet known to lead to escape
+        q = _deque()
+        dep0 = [0] * (n * n)
+        dep1 = [0] * (n * n)
+        # reverse adjacency (moves are symmetric plus 'stay', so predecessors = moves)
+        for g in range(n):
+            gl = len(gm[g])
+            base = g * n
+            for p in range(n):
+                cnt[base + p] = gl
+        for g in range(n):
+            base = g * n
+            for p in range(n):
+                if p == g:
+                    continue
+                if exit_[p] or any(x in capi and x != g for x in pm[p]):
+                    esc1[base + p] = 1
+                    dep1[base + p] = 1
+                    q.append((1, g, p))
+        k = 0
+        while q:
+            k += 1
+            if (k & 4095) == 0 and time.perf_counter() > deadline:
+                raise TimeoutError('duel table')
+            t, g, p = q.popleft()
+            if t == 1:
+                # (g, p, 1) escapes -> ghost-to-move states (g0, p, 0) with g in gm[g0]
+                for g0 in gm[g]:
+                    if g0 == p:
+                        continue
+                    i = g0 * n + p
+                    if esc0[i]:
+                        continue
+                    cnt[i] -= 1
+                    if cnt[i] == 0:
+                        esc0[i] = 1
+                        dep0[i] = dep1[g * n + p] + 1
+                        q.append((0, g0, p))
+            else:
+                # (g, p, 0) escapes -> pacman-to-move states (g, p0, 1) with p in pm[p0]
+                for p0 in pm[p]:
+                    if p0 == g:
+                        continue
+                    i = g * n + p0
+                    if not esc1[i]:
+                        esc1[i] = 1
+                        dep1[i] = dep0[g * n + p] + 1
+                        q.append((1, g, p0))
+        self.esc0, self.esc1 = esc0, esc1
+        self.dep1 = dep1
+        self.dep0 = dep0
+
+    def delay_move(self, me, p, caps):
+        """Invader can escape: the ghost move that makes its escape take longest."""
+        idx, n = self.idx, self.n
+        if me not in idx or p not in idx or frozenset(idx[c] for c in caps if c in idx) != self.caps0:
+            return None
+        g, pi = idx[me], idx[p]
+        best, bv = None, -1
+        for g2 in self.gm[g]:
+            if g2 == pi:
+                return self.cells[g2]
+            v = self.dep1[g2 * n + pi] if self.esc1[g2 * n + pi] else 10 ** 6
+            if v > bv:
+                best, bv = g2, v
+        return None if best is None else self.cells[best]
+
+    def hold_move(self, me, p, caps):
+        """A ghost move that keeps the invader from escaping, preferring to close in;
+        None if the invader can already force an escape (or caps changed)."""
+        idx, n = self.idx, self.n
+        if me not in idx or p not in idx or frozenset(idx[c] for c in caps if c in idx) != self.caps0:
+            return None
+        g, pi = idx[me], idx[p]
+        if self.esc0[g * n + pi]:
+            return None
+        best, bd = None, 1e9
+        for g2 in self.gm[g]:
+            if g2 == pi:
+                return self.cells[g2]          # capture
+            if not self.esc1[g2 * n + pi]:
+                d = abs(self.cells[g2][0] - p[0]) + abs(self.cells[g2][1] - p[1])
+                if d < bd:
+                    best, bd = g2, d
+        return None if best is None else self.cells[best]
+
+
+class _BankTable:
+    """Extension of the duel table to an EMPTY invader: how many plies it needs to eat one
+    of our pellets and then get home (or onto a capsule), with our ghost playing to make
+    that as long as possible. Solved exactly as a min-max shortest-path game (Dijkstra-style
+    retrograde: Pacman states are final when popped, ghost states when all replies are)."""
+    INF = 10 ** 6
+
+    def __init__(self, duel, food, deadline):
+        import heapq
+        D = duel
+        n, gm, cells, idx = D.n, D.gm, D.cells, D.idx
+        INF = self.INF
+        fset = bytearray(n)
+        for f in food:
+            if f in idx:
+                fset[idx[f]] = 1
+        capi = D.caps0
+        val_p = [INF] * (n * n)       # Pacman to move
+        done_p = bytearray(n * n)
+        cnt = [len(gm[g]) for g in range(n) for _ in range(n)]
+        h = []
+        dep0, esc0 = D.dep0, D.esc0
+        for g in range(n):
+            base = g * n
+            for p in range(n):
+                if p == g:
+                    continue
+                best = INF
+                for q in gm[p]:           # Pacman moves = same cell graph
+                    if q == g:
+                        continue
+                    if q in capi:
+                        v = 1
+                    elif fset[q]:
+                        v = 1 + dep0[g * n + q] if esc0[g * n + q] else INF
+                    else:
+                        continue
+                    if v < best:
+                        best = v
+                if best < INF:
+                    val_p[base + p] = best
+                    h.append((best, base + p))
+        heapq.heapify(h)
+        k = 0
+        while h:
+            k += 1
+            if (k & 2047) == 0 and time.perf_counter() > deadline:
+                raise TimeoutError('bank table')
+            v, i = heapq.heappop(h)
+            if done_p[i] or v != val_p[i]:
+                continue
+            done_p[i] = 1
+            g, p = divmod(i, n)
+            # ghost-to-move predecessors (g0, p) with g in gm[g0]
+            for g0 in gm[g]:
+                if g0 == p:
+                    continue
+                j = g0 * n + p
+                cnt[j] -= 1
+                if cnt[j] == 0 and not fset[p]:
+                    gv = v + 1                    # max over replies = last one finalised
+                    # Pacman-to-move predecessors (g0, p0) with p in moves(p0)
+                    for p0 in gm[p]:
+                        if p0 == g0:
+                            continue
+                        jj = g0 * n + p0
+                        if not done_p[jj] and gv + 1 < val_p[jj]:
+                            val_p[jj] = gv + 1
+                            heapq.heappush(h, (gv + 1, jj))
+        self.val_p, self.n, self.duel = val_p, n, D
+
+    def delay_move(self, me, p):
+        D = self.duel
+        idx, n = D.idx, self.n
+        if me not in idx or p not in idx:
+            return None
+        g, pi = idx[me], idx[p]
+        best, bv = None, -1
+        for g2 in D.gm[g]:
+            if g2 == pi:
+                return D.cells[g2]
+            v = self.val_p[g2 * n + pi]
+            if v > bv:
+                best, bv = g2, v
+        return None if best is None else D.cells[best]
+
+
+class _DefendSkills:
+    """Interception skills shared by both of our agents (taken from PlannerDefense)."""
+    predict_path = PlannerDefense.predict_path
+    intercept = PlannerDefense.intercept
+
+    def defend_against(self, gs, o, p, vis):
+        m = self.m
+        me = self.my_pos(gs)
+        scared = gs.get_agent_state(self.index).scared_timer > 0
+        if scared or m.dist(me, p) <= 2:
+            return self.chase_step(me, p, scared)
+        # F2: invader inside a dead end -> hold the exit if we get there first
+        if F('deadend_trap') and vis and m.depth[p] > 0:
+            e = m.exit[p]
+            if m.dist(me, e) <= m.dist(p, e):
+                return self.chase_step(me, e, False) if me != e else 'Stop'
+        # F3: invader heading for our capsule -> stand on it first
+        if F('capsule_guard'):
+            for c in self.get_capsules_you_are_defending(gs):
+                if m.dist(p, c) <= 6 and m.dist(me, c) <= m.dist(p, c):
+                    return self.chase_step(me, c, False) if me != c else 'Stop'
+        tgt = self.intercept(me, self.predict_path(gs, o, p))
+        return self.chase_step(me, tgt if tgt else p, False)
+
+
+# ----------------------------------------------------------------------------- attacker
+class V2Attacker(_DefendSkills, OffensiveIWAgent):
+    def setup(self, gs):
+        self._two_inv = 0
+        self._aduel = None
+        if F('deep_iw'):      # use more of the 1 s move budget for the IW search
+            self.MAX_NODES = 18000
+            self.TIME_BUDGET = 0.5
+        if F('duel_att'):
+            try:
+                # their ghost vs our Pacman on THEIR half; we escape home or onto their capsule
+                self._aduel = _DuelTable(self.m, not self.red, set(self.get_capsules(gs)),
+                                         deadline=time.perf_counter() + 6.0)
+            except Exception:
+                self._aduel = None
+
+    def _trapped(self, ns, me, ghosts, caps_ok):
+        """D3: after our move and the ghosts' reply it is our turn; True if some
+        non-scared ghost can stop us from ever getting home (exact duel table)."""
+        T = self._aduel
+        idx = T.idx
+        p = ns.pos[me]
+        if p not in idx or not caps_ok:
+            return False
+        pi = idx[p]
+        for b in ghosts:
+            gb = ns.pos.get(b)
+            if gb in idx and ns.scared.get(b, 0) == 0 and self.m.dist(gb, p) <= 4 \
+                    and not T.esc1[idx[gb] * T.n + pi]:
+                return True
+        return False
+
+    def act(self, gs):
+        m = self.m
+        me = self.my_pos(gs)
+        st = gs.get_agent_state(self.index)
+        inv = self.invaders(gs)
+        score = gs.get_score() * (1 if self.red else -1)
+        ml = self.moves_left(gs)
+        # F12: protect a lead late in the game
+        if F('lead_protect') and score >= 6 and ml <= 150:
+            if st.is_pacman:
+                path = astar(m, me, set(m.home_border(self.red)), self.danger_cost(self.threats(gs, me), me))
+                if path:
+                    return action_to(me, path[0])
+            else:
+                return self._second_defender(gs, inv) or PlannerDefense.act(self, gs)
+        # F6: two invaders -> come back and take the one the defender is not on
+        self._two_inv = self._two_inv + 1 if len(inv) == 2 else 0
+        if F('two_inv_switch') and self._two_inv >= 3 and st.num_carrying <= 1 \
+                and self.home_dist(me) <= 8 and st.scared_timer == 0:
+            a = self._second_defender(gs, inv)
+            if a:
+                return a
+        # R3 (CS470 paper): two invaders, I am a ghost with no carry and clearly closer to
+        # one invader than my defender is -> take that invader
+        multi = F('multi_inv') or (F('classifier') and _style(self) == 'double')
+        if multi and len(inv) == 2 and not st.is_pacman and st.num_carrying == 0 and st.scared_timer == 0:
+            mate = [t for t in self.get_team(gs) if t != self.index][0]
+            mp = ipos(gs.get_agent_position(mate))
+            best = None
+            for o, p, v in inv:
+                if mp is not None and m.dist(me, p) + 3 <= m.dist(mp, p):
+                    if best is None or m.dist(me, p) < m.dist(me, best[1]):
+                        best = (o, p, v)
+            if best:
+                return self.defend_against(gs, *best)
+        # F5: at home and an invader is visible nearby -> intercept it
+        if F('help_defend') and not st.is_pacman and st.scared_timer == 0 and st.num_carrying == 0:
+            near = [(o, p, v) for o, p, v in inv if v and m.dist(me, p) <= 6]
+            if near:
+                o, p, v = min(near, key=lambda t: m.dist(me, t[1]))
+                return self.defend_against(gs, o, p, v)
+        return self.iw_act(gs)
+
+    def _second_defender(self, gs, inv):
+        if not inv:
+            return None
+        busy = _team(self).get('def_target')
+        cand = [t for t in inv if t[0] != busy] or inv
+        o, p, v = min(cand, key=lambda t: self.m.dist(self.my_pos(gs), t[1]))
+        return self.defend_against(gs, o, p, v)
+
+    # Jan's IWOffense.act with flag-guarded changes (F8 endgame, F9 ghost cutoff,
+    # F10 bank sooner, F11 hunt scared ghosts).
+    def ghost_model(self, sim, s, me_idx):
+        if not F('ghost_cutoff') or s.carry.get(me_idx, 0) == 0:
+            return IWOffense.ghost_model(self, sim, s, me_idx)
+        m = self.m
+        p = s.pos[me_idx]
+        h = self._exit_cell
+        for b in list(s.pos):
+            if sim.is_red(b) == self.red:
+                continue
+            pb = s.pos[b]
+            if sim.is_pacman(b, pb):
+                continue
+            cells = m.nbrs[pb] + [pb]
+            cells = [c for c in cells if not sim.is_pacman(b, c)] or [pb]
+            if s.scared.get(b, 0) > 0:
+                nxt = max(cells, key=lambda c: m.dist(c, p))
+            elif m.dist(pb, p) <= 2:
+                nxt = min(cells, key=lambda c: m.dist(c, p))
+            else:   # stay between the carrier and its way home
+                nxt = min(cells, key=lambda c: (m.dist(c, p) + m.dist(c, h), m.dist(c, p)))
+            s = sim.move(s, b, nxt)
+        return s
+
+    def iw_act(self, gs):
+        a = self.unstick(gs)
+        if a is not None:
+            return a
+        m = self.m
+        sim, root = Sim.from_game(gs, m, tracker=self.tracker, include_unseen=True,
+                                  max_unseen_dist=20 if F('unseen_far') else 12, ref=self.my_pos(gs))
+        me = self.index
+        mate = [t for t in self.get_team(gs) if t != me]
+        for t in mate:
+            for d in (root.pos, root.carry, root.scared, root.deaths, root.kills, root.eaten, root.returned):
+                d.pop(t, None)
+        for b in list(root.pos):
+            if sim.is_red(b) != self.red and sim.is_pacman(b, root.pos[b]):
+                for d in (root.pos, root.carry, root.scared, root.deaths, root.kills, root.eaten, root.returned):
+                    d.pop(b, None)
+        ml = (gs.data.timeleft + 3) // 4 if F('endgame_bank') else self.moves_left(gs)
+        sign = 1 if self.red else -1
+        leaf_w = 0.6 if F('bank_sooner') else self.LEAF_W
+        border = m.home_border(self.red)
+        self._exit_cell = min(border, key=lambda b: m.dist(root.pos[me], b))
+        duel_att = self._aduel is not None
+        if duel_att:
+            ghosts = [b for b in root.pos if sim.is_red(b) != self.red]
+            T = self._aduel
+            caps_now = frozenset(T.idx[c] for c in (root.caps_blue if self.red else root.caps_red) if c in T.idx)
+            caps_ok = caps_now == T.caps0
+        seen = set()
+
+        def atoms(s):
+            yield ('pc', s.pos[me], min(s.carry[me], 12))
+            yield ('caps', len(s.caps_blue if self.red else s.caps_red))
+
+        for a in atoms(root):
+            seen.add(a)
+        score0 = sign * root.score
+        home_steps = m.homedist[self.red][root.pos[me]]
+        last_return = F('endgame_bank') and (root.carry[me] > 0 and home_steps <= ml <= home_steps + 1
+                                             and score0 <= 0 <= score0 + root.carry[me])
+        best_outcome = -2
+        tiebreak = F('tiebreak')
+        cand_best = {}
+        q = _deque([(root, 0, 0.0, None)])
+        best_v, best_first, best_depth = -1e18, None, 99
+        nodes = 0
+        while q and nodes < self.MAX_NODES:
+            if (nodes & 31) == 0 and self.time_left() < 0:
+                break
+            s, depth, acc, first = q.popleft()
+            if depth >= ml:
+                continue
+            for c in sim.succ_cells(s, me):
+                ns = sim.move(s, me, c)
+                ns = self.ghost_model(sim, ns, me)
+                nodes += 1
+                g = self.GAMMA ** depth
+                r = 10.0 * (ns.eaten[me] - s.eaten[me]) + 100.0 * sign * (ns.score - s.score)
+                if len(ns.caps_blue if self.red else ns.caps_red) < len(s.caps_blue if self.red else s.caps_red):
+                    r += 40.0
+                if F('hunt_scared') and ns.kills[me] > s.kills[me]:
+                    r += 60.0
+                dead = ns.deaths[me] > s.deaths[me]
+                if dead:
+                    r -= (300.0 if F('bolder') else 600.0) + 10.0 * s.carry[me]
+                nacc = acc + g * r
+                f = first if first is not None else c
+                leaf = nacc - leaf_w * ns.carry[me] * m.homedist[self.red][ns.pos[me]] * g
+                if duel_att and not dead and ns.carry[me] > 0 and self._trapped(ns, me, ghosts, caps_ok):
+                    leaf -= (60.0 + 10.0 * ns.carry[me]) * g
+                outcome = 0
+                if last_return:
+                    bs = sign * ns.score
+                    outcome = (bs > 0) - (bs < 0)
+                if tiebreak:
+                    key = (outcome, leaf)
+                    if key > cand_best.get(f, (-9, -1e18)):
+                        cand_best[f] = key
+                if outcome > best_outcome or (outcome == best_outcome and
+                        (leaf > best_v + 1e-9 or (abs(leaf - best_v) <= 1e-9 and depth + 1 < best_depth))):
+                    best_outcome = outcome
+                    best_v, best_first, best_depth = leaf, f, depth + 1
+                if dead:
+                    continue
+                novel = False
+                for a in atoms(ns):
+                    if a not in seen:
+                        seen.add(a)
+                        novel = True
+                if novel:
+                    q.append((ns, depth + 1, nacc, f))
+        self.iw_nodes = nodes
+        if best_first is None or best_v <= 0:
+            return PlannerOffense.act(self, gs)
+        if tiebreak:
+            # R1 (CS470 paper): random choice among first moves within 2 points of the best
+            near = [f for f, (o, v) in cand_best.items() if o == best_outcome and v >= best_v - 2.0]
+            if len(near) > 1:
+                return action_to(root.pos[me], random.choice(sorted(near)))
+        return action_to(root.pos[me], best_first)
+
+
+# ----------------------------------------------------------------------------- defender
+class V2Defender(_DefendSkills, DefensiveInterceptAgent):
+    RAID_WAIT = 40       # our turns without any invader before a raid
+    RAID_DEPTH = 4       # only food this close to the border
+    RAID_CARRY = 2
+
+    def setup(self, gs):
+        self._quiet = 0
+        self._bneck, self._bcover = None, set()
+        self._duel = None
+        if F('duel_def'):
+            try:
+                self._duel = _DuelTable(self.m, self.red, set(self.get_capsules_you_are_defending(gs)),
+                                        deadline=time.perf_counter() + 8.0)
+            except Exception:
+                self._duel = None
+        self._bank, self._bank_key, self._duel_caps = None, None, None
+        if self._duel is not None:
+            self._duel_caps = frozenset(self.get_capsules_you_are_defending(gs))
+        if F('bottleneck'):
+            try:
+                self._compute_bottleneck(gs)
+            except Exception:
+                self._bneck = None
+
+    def _refresh_tables(self, gs):
+        caps = frozenset(self.get_capsules_you_are_defending(gs))
+        if F('duel_rebuild') and caps != self._duel_caps and self.time_left() > 0.45:
+            self._duel_caps = caps
+            try:
+                self._duel = _DuelTable(self.m, self.red, set(caps), deadline=time.perf_counter() + 0.25)
+                self._bank_key = None
+            except Exception:
+                pass
+        if F('bank_delay'):
+            key = (caps, frozenset(self.get_food_you_are_defending(gs).as_list()))
+            if key != self._bank_key and self.time_left() > 0.45 and self._duel.caps0 == frozenset(
+                    self._duel.idx[c] for c in caps if c in self._duel.idx):
+                self._bank_key = key
+                try:
+                    self._bank = _BankTable(self._duel, key[1], deadline=time.perf_counter() + 0.25)
+                except Exception:
+                    self._bank = None
+            elif self._duel.caps0 != frozenset(self._duel.idx[c] for c in caps if c in self._duel.idx):
+                self._bank = None
+
+    def _compute_bottleneck(self, gs):
+        """R4 (Pacamon / Supergodgg / CS470): the home cell whose removal cuts the most of
+        our food off from the border. Kept only if it covers >= 40% of our food."""
+        m = self.m
+        red = self.red
+        home = [c for c in m.cells if m.on_home_side(c, red)]
+        food = set(self.get_food_you_are_defending(gs).as_list())
+        border = set(m.home_border(red))
+        best, bcov = None, set()
+        for c in home:
+            if c in border or len(m.nbrs[c]) < 2:
+                continue
+            seen = set(b for b in border if b != c)
+            q = _deque(seen)
+            while q:
+                u = q.popleft()
+                for v in m.nbrs[u]:
+                    if v != c and v not in seen and m.on_home_side(v, red):
+                        seen.add(v)
+                        q.append(v)
+            cov = {f for f in food if f not in seen}
+            if len(cov) > len(bcov) or (len(cov) == len(bcov) and cov and m.homedist[red][c] < m.homedist[red][best]):
+                best, bcov = c, cov
+        if food and len(bcov) >= 0.4 * len(food):
+            self._bneck, self._bcover = best, bcov
+
+    def predict_path(self, gs, o, start, steps=40):
+        # F1: carriers with >= 2 pellets are predicted to head home (Jan: >= 5)
+        if F('exit_guard') and gs.get_agent_state(o).num_carrying >= 2:
+            border = set(self.m.home_border(not self.red))
+            return [start] + (astar(self.m, start, border) or [])
+        return PlannerDefense.predict_path(self, gs, o, start, steps)
+
+    def act(self, gs):
+        m = self.m
+        me = self.my_pos(gs)
+        st = gs.get_agent_state(self.index)
+        inv = self.invaders(gs)
+        score = gs.get_score() * (1 if self.red else -1)
+        ml = self.moves_left(gs)
+        self._quiet = 0 if inv else self._quiet + 1
+        _observe_style(self, len(inv))
+        style = _style(self)
+        raiding = False
+        # D1 (Ericd71-style double offense): attack with IW unless an invader is in and
+        # I am the better-placed defender (on home side, or carrying nothing and close)
+        if F('dual') and (not F('gate_calm') or _calm(self)):
+            mate = [t for t in self.get_team(gs) if t != self.index][0]
+            ms = gs.get_agent_state(mate)
+            mp = ipos(gs.get_agent_position(mate))
+            if inv:
+                o, p, vis = min(inv, key=lambda t: m.dist(me, t[1]))
+                my_d = m.dist(me, p) + (0 if not st.is_pacman else 4 + 2 * st.num_carrying)
+                mate_d = (m.dist(mp, p) + (0 if not ms.is_pacman else 4 + 2 * ms.num_carrying)) if mp else 99
+                if my_d <= mate_d or len(inv) == 2:
+                    if st.is_pacman and st.num_carrying > 0:
+                        path = astar(m, me, set(m.home_border(self.red)),
+                                     self.danger_cost(self.threats(gs, me), me))
+                        if path:
+                            return action_to(me, path[0])
+                    _team(self)['def_target'] = o
+                    return self.defend_against(gs, o, p, vis)
+            return IWOffense.act(self, gs)
+        # R7 (Supergodgg): quick safe raid of border food whenever nobody invades
+        if F('border_raid') and not inv and self._quiet >= 3 and (not F('gate_calm') or _calm(self)):
+            a = self._raid(gs, me, st, deep=False, depth=5, carry=3)
+            if a:
+                return a
+        # R2: classifier says the opponent turtles -> defender attacks near the border
+        if F('classifier') and style == 'turtle' and not inv:
+            a = self._raid(gs, me, st, deep=False, depth=6, carry=3)
+            raiding = True
+            if a:
+                return a
+        # R6 (Supergodgg): opponent ghosts scared -> quick raid
+        if F('scared_raid') and not inv:
+            sc = [gs.get_agent_state(o).scared_timer for o in self.get_opponents(gs)
+                  if not gs.get_agent_state(o).is_pacman]
+            if sc and min(sc) >= 15:
+                a = self._raid(gs, me, st, deep=False, depth=5, carry=3)
+                raiding = True
+                if a:
+                    return a
+        # D2 (pursuit-evasion retrograde table): hold a visible invader that cannot escape
+        if self._duel is not None and inv and not st.is_pacman and st.scared_timer == 0:
+            self._refresh_tables(gs)
+            vis_inv = [(o, p) for o, p, v in inv if v]
+            if vis_inv:
+                o, p = min(vis_inv, key=lambda t: m.dist(me, t[1]))
+                a = self._duel.hold_move(me, p, set(self.get_capsules_you_are_defending(gs)))
+                if a is not None:
+                    _team(self)['def_target'] = o
+                    return action_to(me, a)
+                if F('duel_delay') and gs.get_agent_state(o).num_carrying > 0 and m.dist(me, p) <= (99 if F('delay_wide') else 6):
+                    a = self._duel.delay_move(me, p, set(self.get_capsules_you_are_defending(gs)))
+                    if a is not None:
+                        _team(self)['def_target'] = o
+                        return action_to(me, a)
+                # D4: empty invader -> maximise the time it needs to eat a pellet and bank it
+                if F('bank_delay') and self._bank is not None and gs.get_agent_state(o).num_carrying == 0 \
+                        and m.dist(me, p) <= 10:
+                    a = self._bank.delay_move(me, p)
+                    if a is not None:
+                        _team(self)['def_target'] = o
+                        return action_to(me, a)
+        # R4: hold the bottleneck unless two invaders are in
+        if F('bottleneck') and self._bneck and len(inv) < 2 and not st.is_pacman and st.scared_timer == 0:
+            b = self._bneck
+            if not inv:
+                return self.chase_step(me, b, False) if me != b else 'Stop'
+            o, p, vis = inv[0]
+            if p in self._bcover and m.dist(me, p) > 2:
+                return self.chase_step(me, b, False) if me != b else 'Stop'
+        # F13: behind late with nobody invading -> attack too
+        if (F('late_allin') or F('allin_any')) and score < 0 and (ml <= 200 or F('allin_any')) and not inv:
+            a = self._raid(gs, me, st, deep=True)
+            if a:
+                return a
+        # F7: opponents never invade -> short safe raids near the border
+        if F('turtle_raid') and self._quiet >= self.RAID_WAIT:
+            a = self._raid(gs, me, st, deep=False)
+            if a:
+                return a
+        # F16: opening rush while nobody has crossed yet
+        if F('open_rush') and ml >= 265 and not inv:
+            a = self._raid(gs, me, st, deep=False)
+            if a:
+                return a
+        if st.is_pacman and (F('turtle_raid') or F('late_allin') or F('open_rush')
+                             or F('classifier') or F('scared_raid') or F('border_raid')):
+            # raiding ended (invader appeared): run straight home
+            path = astar(m, me, set(m.home_border(self.red)), self.danger_cost(self.threats(gs, me), me))
+            if path:
+                return action_to(me, path[0])
+        if inv:
+            def key(t):
+                o, p, vis = t
+                return (not vis, o not in self.tracker.eaten_hint, m.dist(me, p))
+            o, p, vis = min(inv, key=key)
+            _team(self)['def_target'] = o
+            if F('exit_guard') or F('deadend_trap') or F('capsule_guard'):
+                return self.defend_against(gs, o, p, vis)
+            return PlannerDefense.act(self, gs)
+        _team(self)['def_target'] = None
+        if F('smart_patrol'):
+            return self._patrol(gs, me)
+        return PlannerDefense.act(self, gs)
+
+    def _raid(self, gs, me, st, deep, depth=None, carry=None):
+        m = self.m
+        threats = self.threats(gs, me)
+        food = self.get_food(gs).as_list()
+        lim = 99 if deep else (depth or self.RAID_DEPTH)
+        if deep:
+            return IWOffense.act(self, gs)
+        if st.num_carrying >= (carry or self.RAID_CARRY) or (threats and min(m.dist(me, g) for g in threats) <= 4):
+            goals = set(m.home_border(self.red))
+        else:
+            goals = {f for f in food if m.homedist[self.red][f] <= lim and
+                     (not threats or self.food_is_safe(f, me, threats))}
+            if not goals:
+                goals = set(m.home_border(self.red)) if st.is_pacman else None
+        if not goals:
+            return None
+        path = astar(m, me, goals, self.danger_cost(threats, me))
+        if path:
+            return action_to(me, path[0])
+        return None
+
+    def _patrol(self, gs, me):
+        """F4: border cell minimising expected distance to the opponents' belief mass,
+        plus a pull towards the food we defend."""
+        m = self.m
+        border = m.home_border(self.red)
+        food = self.get_food_you_are_defending(gs).as_list()
+        bel = []
+        for o in self.get_opponents(gs):
+            b = self.tracker.belief[o]
+            top = sorted(b.items(), key=lambda kv: -kv[1])[:15]
+            tot = sum(p for _, p in top) or 1.0
+            bel.append([(c, p / tot) for c, p in top])
+
+        def cost(bc):
+            e = sum(min(sum(p * m.dist(bc, c) for c, p in bl), 99) for bl in bel) / max(1, len(bel))
+            fd = min((m.dist(bc, f) for f in food), default=0)
+            return e + 0.5 * fd
+        target = min(border, key=cost)
+        return self.chase_step(me, target, False)
+
+
+# unstick() and IW helpers are needed when the defender attacks
+for _n in ('unstick', 'ghost_model', 'TIME_BUDGET', 'GAMMA', 'MAX_NODES', 'USE_CARRY_ATOM',
+           'LEAF_W', 'STUCK_TURNS', 'STUCK_PUSH', 'BASE_LIMIT'):
+    if not hasattr(V2Defender, _n):
+        setattr(V2Defender, _n, getattr(IWOffense, _n))
+
+
+def create_team(first_index, second_index, is_red, first='V2Attacker', second='V2Defender', num_training=0):
+    _TEAM.pop(is_red, None)
+    return [eval(first)(first_index), eval(second)(second_index)]
