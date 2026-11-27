@@ -19,12 +19,12 @@ import sys
 import time
 
 # my_team.py for the UPF Pacman contest, built by pacman-work/experiments/build_pacman_agent.py
-# from the staff template + pacman-work/agents/{upf_fc_core, a2_astar, a6_iw}.py.
+# from the staff template + pacman-work/agents/{upf_fc_core, a2_astar, a6_iw, a12_trap}.py.
 # Structure: [template header] [template create_team] [template reflex agents, unchanged,
 # used as fallback] [our toolkit and planners] [our team agents].
 #
 # ---------------- GUIDE FOR READERS: search for "[KEY-" to jump to each feature ----------------
-# Team: Asian-Pacmen. Attacker = IWOffense (width-based IW(1) search), defender = PlannerDefense (A* interception).
+# Team: Asian-Pacmen. Attacker = IWOffense (width-based IW(1) search), defender = TrapDefense (A* interception + trapping).
 #  [KEY-1]  all-pairs maze distances, precomputed at startup
 #  [KEY-2]  dead-end analysis of the map (trap avoidance)
 #  [KEY-3]  HMM belief tracking of unseen opponents
@@ -36,6 +36,7 @@ import time
 #  [KEY-9]  ATTACKER: IW(1) width-based planning (main novelty, beyond lecture)
 #  [KEY-10] stalemate breaker (found by analysing losses to last edition's teams)
 #  [KEY-11] opponent ghost model inside the search
+#  [KEY-12] DEFENDER: trapping (cut the invader off from home, then close in), from the tournament replays
 # Full experiments, ablations and results: pacman-work/REPORT.md
 # -----------------------------------------------------------------------------------------------
 
@@ -1170,6 +1171,70 @@ class IWOffense(PlannerOffense):
             return PlannerOffense.act(self, gs)
         return action_to(root.pos[me], best_first)
 
+# ========================= our code: agents/a12_trap.py =========================
+
+"""
+Approach A12 -- the submitted A6 attacker + a defender that traps invaders.
+
+Limitation addressed (tournament replays, REPORT.md): in the games we lost, our A2 defender
+caught 0.4 invaders per game. It steps greedily towards a predicted cell, and an invader
+that dodges around a loop or waits is never cornered.
+
+Trapping (Voronoi / territory reasoning on the precomputed maze distances):
+  for every move n of the defender, the invader at p "owns" the cells it reaches strictly
+  before us (D[p][c] < D[n][c]). We pick the move that
+    1. leaves the invader no escape cell on its own border (it cannot get home with the food),
+    2. leaves it no capsule of ours to eat,
+    3. shrinks its territory on our side (less food it can still take),
+    4. then gets closest.
+  This walls the invader off from home first and then closes in, instead of chasing it.
+Used for a visible invader when we are not scared; otherwise A2 behaviour is kept.
+"""
+import os
+import sys
+
+
+
+
+# [KEY-12] DEFENDER trapping: block the invader's way home first, then close in.
+class TrapDefense(PlannerDefense):
+    TRAP_RANGE = 12      # use trapping when the visible invader is this close (maze distance)
+
+    def trap_step(self, gs, me, p):
+        m = self.m
+        D, idx = m.D, m.idx
+        rp = D[idx[p]]
+        esc = [idx[b] for b in m.home_border(not self.red)]
+        caps = [idx[c] for c in self.get_capsules_you_are_defending(gs)]
+        food = [idx[f] for f in self.get_food_you_are_defending(gs).as_list()]
+        best, bv = None, None
+        for n in m.nbrs[me] + [me]:
+            if not m.on_home_side(n, self.red):
+                continue
+            if n == p:
+                return action_to(me, n)
+            rn = D[idx[n]]
+            v = (sum(1 for c in esc if rp[c] < rn[c]),
+                 sum(1 for c in caps if rp[c] < rn[c]),
+                 sum(1 for c in food if rp[c] < rn[c]),
+                 rn[idx[p]])
+            if bv is None or v < bv:
+                best, bv = n, v
+        return action_to(me, best) if best else None
+
+    def act(self, gs):
+        me = self.my_pos(gs)
+        st = gs.get_agent_state(self.index)
+        if st.scared_timer == 0:
+            vis = [(o, p) for o, p, v in self.invaders(gs) if v]
+            if vis:
+                o, p = min(vis, key=lambda t: self.m.dist(me, t[1]))
+                if self.m.dist(me, p) <= self.TRAP_RANGE:
+                    a = self.trap_step(gs, me, p)
+                    if a is not None:
+                        return a
+        return PlannerDefense.act(self, gs)
+
 
 #####################
 # Our team's agents #
@@ -1193,7 +1258,7 @@ class OffensiveIWAgent(IWOffense, OffensiveReflexAgent):
         return OffensiveReflexAgent.choose_action(self, game_state)
 
 
-class DefensiveInterceptAgent(PlannerDefense, DefensiveReflexAgent):
+class DefensiveInterceptAgent(TrapDefense, DefensiveReflexAgent):
     """
     Defensive agent (approach A2): predicts the invader's greedy path to our food (or
     back home) from the HMM belief and intercepts it at the first predicted cell it can
